@@ -8,6 +8,15 @@
   <div class="error" style="margin-bottom: 1rem;">{{ error }}</div>
 {% endif %}
 
+{% if editing and form_enabled is defined and not form_enabled %}
+<div class="error" style="margin-bottom: 1rem; display: flex; justify-content: space-between; align-items: center; gap: 1rem;">
+  <span>{{ t("etf-disabled-banner") }}</span>
+  <form method="post" action="{{ toggle_url }}" style="margin: 0;">
+    <button type="submit" class="slot-btn" style="font-size: 0.8rem; cursor: pointer;">{{ t("event-types-enable") }}</button>
+  </form>
+</div>
+{% endif %}
+
 <form method="POST">
 
 {% if preset is defined and preset %}
