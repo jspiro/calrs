@@ -3166,7 +3166,7 @@ pub(super) async fn duplicate_event_type(
     if let Err(resp) = verify_csrf_token(&headers, &csrf._csrf) {
         return resp;
     }
-    let et: Option<(String,)> = sqlx::query_as(
+    let et_id: Option<String> = sqlx::query_scalar(
         "SELECT et.id FROM event_types et
          JOIN accounts a ON a.id = et.account_id
          WHERE et.slug = ? AND a.user_id = ? AND et.team_id IS NULL",
@@ -3176,17 +3176,10 @@ pub(super) async fn duplicate_event_type(
     .fetch_optional(&state.pool)
     .await
     .unwrap_or(None);
-
-    let Some((et_id,)) = et else {
-        return Redirect::to("/dashboard/event-types").into_response();
-    };
-    match duplicate_event_type_rows(&state.pool, &et_id, auth_user.lang).await {
-        Some(new_slug) => {
-            tracing::info!(event_type_id = %et_id, new_slug = %new_slug, user_id = %auth_user.user.id, "event type duplicated");
-            Redirect::to(&format!("/dashboard/event-types/{new_slug}/edit")).into_response()
-        }
-        None => Redirect::to("/dashboard/event-types").into_response(),
-    }
+    duplicate_and_open(&state, &auth_user, et_id, |s| {
+        format!("/dashboard/event-types/{s}/edit")
+    })
+    .await
 }
 
 /// Copies the team event type `slug` of `team_id` for a team admin (or a
@@ -3202,59 +3195,49 @@ pub(super) async fn duplicate_group_event_type(
     if let Err(resp) = verify_csrf_token(&headers, &csrf._csrf) {
         return resp;
     }
-    let user = &auth_user.user;
-    let et: Option<(String,)> = if user.role == "admin" {
-        sqlx::query_as("SELECT id FROM event_types WHERE team_id = ? AND slug = ?")
+    let et_id: Option<String> =
+        sqlx::query_scalar("SELECT id FROM event_types WHERE team_id = ? AND slug = ?")
             .bind(&team_id)
             .bind(&slug)
             .fetch_optional(&state.pool)
             .await
-            .unwrap_or(None)
-    } else {
-        sqlx::query_as(
-            "SELECT et.id FROM event_types et
-             JOIN team_members tm ON tm.team_id = et.team_id
-             WHERE et.team_id = ? AND et.slug = ? AND tm.user_id = ? AND tm.role = 'admin' LIMIT 1",
-        )
-        .bind(&team_id)
-        .bind(&slug)
-        .bind(&user.id)
-        .fetch_optional(&state.pool)
-        .await
-        .unwrap_or(None)
-    };
-
-    let Some((et_id,)) = et else {
-        return Redirect::to("/dashboard/event-types").into_response();
-    };
-    match duplicate_event_type_rows(&state.pool, &et_id, auth_user.lang).await {
-        Some(new_slug) => {
-            tracing::info!(event_type_id = %et_id, new_slug = %new_slug, user_id = %user.id, "group event type duplicated");
-            Redirect::to(&format!(
-                "/dashboard/group-event-types/{team_id}/{new_slug}/edit"
-            ))
-            .into_response()
-        }
-        None => Redirect::to("/dashboard/event-types").into_response(),
-    }
+            .unwrap_or(None);
+    duplicate_and_open(&state, &auth_user, et_id, |s| {
+        format!("/dashboard/group-event-types/{team_id}/{s}/edit")
+    })
+    .await
 }
 
-/// Every `event_types` column copied onto a duplicate: all of them except
-/// `id`, `slug`, `title` (which the copy gets its own) and `created_at`.
-const EVENT_TYPE_COPIED_COLUMNS: &str = "account_id, description, duration_min, location_type, \
-    location_value, buffer_before, buffer_after, min_notice_min, requires_confirmation, \
-    group_id, created_by_user_id, reminder_minutes, is_private, max_additional_guests, \
-    scheduling_mode, visibility, team_id, default_calendar_view, slot_interval_min, \
-    first_slot_only, timezone, cancel_notice_min, reschedule_notice_min, \
-    meeting_pattern_override, pending_blocks_slot, pending_expiry_hours, \
-    resource_scheduling_mode, booking_horizon_days, sms_phone_mode";
+/// Duplicates `et_id` when the caller may manage it and redirects to the
+/// copy's edit form at `edit_url(new_slug)`; a missing or foreign event type
+/// or a failed copy redirects to the list instead.
+async fn duplicate_and_open(
+    state: &AppState,
+    auth_user: &crate::auth::AuthUser,
+    et_id: Option<String>,
+    edit_url: impl Fn(&str) -> String,
+) -> axum::response::Response {
+    let list = Redirect::to("/dashboard/event-types").into_response();
+    let Some(et_id) = et_id else { return list };
+    if !can_manage_event_type(&state.pool, &auth_user.user, &et_id).await {
+        return list;
+    }
+    match duplicate_event_type_rows(&state.pool, &et_id, auth_user.lang).await {
+        Some(new_slug) => {
+            tracing::info!(event_type_id = %et_id, new_slug = %new_slug, user_id = %auth_user.user.id, "event type duplicated");
+            Redirect::to(&edit_url(&new_slug)).into_response()
+        }
+        None => list,
+    }
+}
 
 /// Copies event type `et_id` with every setting and child row (availability
 /// rules and overrides, calendar selection, member weights, booking limits,
 /// watchers, resources) under the first free `<slug>-copy[-N]` slug, titled
-/// per `event-types-duplicate-title` in `lang`. Returns the new slug; `None`
-/// when the source is gone or a write failed, in which case nothing is kept.
-/// Bookings and invite links belong to the original and are not copied.
+/// per `event-types-duplicate-title` in `lang`, and disabled. Returns the new
+/// slug; `None` when the source is gone or a write failed, in which case
+/// nothing is kept. Bookings and invite links belong to the original and are
+/// not copied.
 ///
 /// The slug is chosen before the write transaction, so two copies of one
 /// event type made at the same instant can pick the same slug and the later
@@ -3276,6 +3259,35 @@ pub(super) async fn duplicate_event_type_rows(
 
 const DUPLICATE_ATTEMPTS: u32 = 3;
 
+/// `event_types` columns a copy gets of its own rather than from the source.
+const COPY_OWN_COLUMNS: [&str; 5] = ["id", "slug", "title", "enabled", "created_at"];
+
+/// Child tables copied along with an event type: table, the columns after
+/// `event_type_id`, and whether rows carry their own `id` (minted fresh).
+const COPIED_CHILD_TABLES: [(&str, &str, bool); 7] = [
+    (
+        "availability_rules",
+        "day_of_week, start_time, end_time",
+        true,
+    ),
+    (
+        "availability_overrides",
+        "date, start_time, end_time, is_blocked",
+        true,
+    ),
+    (
+        "booking_frequency_limits",
+        "max_bookings, period, per_member",
+        true,
+    ),
+    ("event_type_calendars", "calendar_id", false),
+    ("event_type_member_weights", "user_id, weight", false),
+    ("event_type_watchers", "team_id", false),
+    ("event_type_resources", "resource_id", false),
+];
+
+type Tx<'a> = sqlx::Transaction<'a, sqlx::Sqlite>;
+
 async fn duplicate_event_type_once(pool: &SqlitePool, et_id: &str, lang: &str) -> Option<String> {
     let (account_id, team_id, slug, title): (String, Option<String>, String, String) =
         sqlx::query_as("SELECT account_id, team_id, slug, title FROM event_types WHERE id = ?")
@@ -3288,9 +3300,10 @@ async fn duplicate_event_type_once(pool: &SqlitePool, et_id: &str, lang: &str) -
     let new_id = uuid::Uuid::new_v4().to_string();
 
     let mut tx = pool.begin().await.ok()?;
+    let columns = copied_columns(&mut tx).await.ok()?;
     sqlx::query(&format!(
-        "INSERT INTO event_types (id, slug, title, enabled, {EVENT_TYPE_COPIED_COLUMNS})
-         SELECT ?, ?, ?, 0, {EVENT_TYPE_COPIED_COLUMNS} FROM event_types WHERE id = ?"
+        "INSERT INTO event_types (id, slug, title, enabled, {columns})
+         SELECT ?, ?, ?, 0, {columns} FROM event_types WHERE id = ?"
     ))
     .bind(&new_id)
     .bind(&new_slug)
@@ -3298,12 +3311,28 @@ async fn duplicate_event_type_once(pool: &SqlitePool, et_id: &str, lang: &str) -
     .bind(et_id)
     .execute(&mut *tx)
     .await
-    .ok()?;
+    .ok()
+    // Zero rows means the source vanished since the lookup: no copy to open.
+    .filter(|done| done.rows_affected() == 1)?;
     copy_event_type_children(&mut tx, et_id, &new_id)
         .await
         .ok()?;
     tx.commit().await.ok()?;
     Some(new_slug)
+}
+
+/// Every `event_types` column outside `COPY_OWN_COLUMNS`, read from the live
+/// schema so a column added later is copied too, as a comma-separated list.
+async fn copied_columns(tx: &mut Tx<'_>) -> sqlx::Result<String> {
+    let names: Vec<(String,)> = sqlx::query_as("SELECT name FROM pragma_table_info('event_types')")
+        .fetch_all(&mut **tx)
+        .await?;
+    Ok(names
+        .into_iter()
+        .map(|(name,)| name)
+        .filter(|name| !COPY_OWN_COLUMNS.contains(&name.as_str()))
+        .collect::<Vec<_>>()
+        .join(", "))
 }
 
 /// Returns `<slug>-copy`, or `<slug>-copy-N` for the smallest N from 2 that
@@ -3336,91 +3365,24 @@ async fn free_copy_slug(
     None
 }
 
-/// Copies every child row of event type `from` onto `to` inside `tx`. Rows
-/// with their own primary key get fresh UUIDs; junction rows are copied as is.
-async fn copy_event_type_children(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    from: &str,
-    to: &str,
-) -> sqlx::Result<()> {
-    let rules: Vec<(i64, String, String)> = sqlx::query_as(
-        "SELECT day_of_week, start_time, end_time FROM availability_rules WHERE event_type_id = ?",
-    )
-    .bind(from)
-    .fetch_all(&mut **tx)
-    .await?;
-    for (day, start, end) in rules {
-        sqlx::query(
-            "INSERT INTO availability_rules (id, event_type_id, day_of_week, start_time, end_time)
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
+/// Copies every row of each `COPIED_CHILD_TABLES` table from event type
+/// `from` onto `to` inside `tx`; rows with their own `id` get a fresh one
+/// minted by SQLite (32 hex characters, unique like the UUIDs beside them).
+async fn copy_event_type_children(tx: &mut Tx<'_>, from: &str, to: &str) -> sqlx::Result<()> {
+    for (table, columns, has_id) in COPIED_CHILD_TABLES {
+        let (id_column, id_value) = if has_id {
+            ("id, ", "lower(hex(randomblob(16))), ")
+        } else {
+            ("", "")
+        };
+        sqlx::query(&format!(
+            "INSERT INTO {table} ({id_column}event_type_id, {columns})
+             SELECT {id_value}?, {columns} FROM {table} WHERE event_type_id = ?"
+        ))
         .bind(to)
-        .bind(day)
-        .bind(start)
-        .bind(end)
+        .bind(from)
         .execute(&mut **tx)
         .await?;
-    }
-
-    let overrides: Vec<(String, Option<String>, Option<String>, i64)> = sqlx::query_as(
-        "SELECT date, start_time, end_time, is_blocked FROM availability_overrides
-         WHERE event_type_id = ?",
-    )
-    .bind(from)
-    .fetch_all(&mut **tx)
-    .await?;
-    for (date, start, end, blocked) in overrides {
-        sqlx::query(
-            "INSERT INTO availability_overrides (id, event_type_id, date, start_time, end_time, is_blocked)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(to)
-        .bind(date)
-        .bind(start)
-        .bind(end)
-        .bind(blocked)
-        .execute(&mut **tx)
-        .await?;
-    }
-
-    let limits: Vec<(i64, String, i64)> = sqlx::query_as(
-        "SELECT max_bookings, period, per_member FROM booking_frequency_limits
-         WHERE event_type_id = ?",
-    )
-    .bind(from)
-    .fetch_all(&mut **tx)
-    .await?;
-    for (max_bookings, period, per_member) in limits {
-        sqlx::query(
-            "INSERT INTO booking_frequency_limits (id, event_type_id, max_bookings, period, per_member)
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(to)
-        .bind(max_bookings)
-        .bind(period)
-        .bind(per_member)
-        .execute(&mut **tx)
-        .await?;
-    }
-
-    for sql in [
-        "INSERT INTO event_type_calendars (event_type_id, calendar_id)
-         SELECT ?, calendar_id FROM event_type_calendars WHERE event_type_id = ?",
-        "INSERT INTO event_type_member_weights (event_type_id, user_id, weight)
-         SELECT ?, user_id, weight FROM event_type_member_weights WHERE event_type_id = ?",
-        "INSERT INTO event_type_watchers (event_type_id, team_id)
-         SELECT ?, team_id FROM event_type_watchers WHERE event_type_id = ?",
-        "INSERT INTO event_type_resources (event_type_id, resource_id)
-         SELECT ?, resource_id FROM event_type_resources WHERE event_type_id = ?",
-    ] {
-        sqlx::query(sql)
-            .bind(to)
-            .bind(from)
-            .execute(&mut **tx)
-            .await?;
     }
     Ok(())
 }
