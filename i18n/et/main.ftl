@@ -847,7 +847,7 @@ team-settings-delete-confirm = Kas kustutada meeskond „{ $name }“? Seda ei s
 
 etf-heading-edit = Muuda sündmuse tüüpi
 etf-heading-new = Uus sündmuse tüüp
-etf-disabled-banner = See sündmuse tüüp on keelatud, seega ei saa keegi seda veel broneerida.
+etf-disabled-banner = See sündmuse tüüp on välja lülitatud, seega ei saa keegi seda veel broneerida.
 etf-team = Meeskond
 etf-team-hint = (valikuline — jäta tühjaks isikliku sündmuse tüübi jaoks)
 etf-team-personal = Isiklik

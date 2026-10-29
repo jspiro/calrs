@@ -3182,7 +3182,7 @@ pub(super) async fn duplicate_event_type(
     };
     match duplicate_event_type_rows(&state.pool, &et_id, auth_user.lang).await {
         Some(new_slug) => {
-            tracing::info!(event_type_id = %et_id, new_slug = %new_slug, user = %auth_user.user.email, "event type duplicated");
+            tracing::info!(event_type_id = %et_id, new_slug = %new_slug, user_id = %auth_user.user.id, "event type duplicated");
             Redirect::to(&format!("/dashboard/event-types/{new_slug}/edit")).into_response()
         }
         None => Redirect::to("/dashboard/event-types").into_response(),
@@ -3229,7 +3229,7 @@ pub(super) async fn duplicate_group_event_type(
     };
     match duplicate_event_type_rows(&state.pool, &et_id, auth_user.lang).await {
         Some(new_slug) => {
-            tracing::info!(event_type_id = %et_id, new_slug = %new_slug, user = %user.email, "group event type duplicated");
+            tracing::info!(event_type_id = %et_id, new_slug = %new_slug, user_id = %user.id, "group event type duplicated");
             Redirect::to(&format!(
                 "/dashboard/group-event-types/{team_id}/{new_slug}/edit"
             ))
@@ -3255,11 +3255,28 @@ const EVENT_TYPE_COPIED_COLUMNS: &str = "account_id, description, duration_min, 
 /// per `event-types-duplicate-title` in `lang`. Returns the new slug; `None`
 /// when the source is gone or a write failed, in which case nothing is kept.
 /// Bookings and invite links belong to the original and are not copied.
+///
+/// The slug is chosen before the write transaction, so two copies of one
+/// event type made at the same instant can pick the same slug and the later
+/// insert then hits the unique constraint; a locked database fails the same
+/// way. Each attempt is all-or-nothing, so the copy is simply retried with
+/// a fresh slug lookup.
 pub(super) async fn duplicate_event_type_rows(
     pool: &SqlitePool,
     et_id: &str,
     lang: &str,
 ) -> Option<String> {
+    for _ in 0..DUPLICATE_ATTEMPTS {
+        if let Some(slug) = duplicate_event_type_once(pool, et_id, lang).await {
+            return Some(slug);
+        }
+    }
+    None
+}
+
+const DUPLICATE_ATTEMPTS: u32 = 3;
+
+async fn duplicate_event_type_once(pool: &SqlitePool, et_id: &str, lang: &str) -> Option<String> {
     let (account_id, team_id, slug, title): (String, Option<String>, String, String) =
         sqlx::query_as("SELECT account_id, team_id, slug, title FROM event_types WHERE id = ?")
             .bind(et_id)

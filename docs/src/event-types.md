@@ -195,7 +195,7 @@ Event types can be toggled on/off from the dashboard without deleting them. Disa
 
 ## Duplicating
 
-**Duplicate** in an event type's `⋯` menu creates a copy with every setting: duration, buffers, notice, location, confirmation and visibility, weekly availability and date overrides, calendar selection, booking limits, resources, and for team event types the member priorities and watchers. The copy is titled "*Title* (copy)" under the slug `<slug>-copy` (or `-copy-2`, `-copy-3`, ... when taken) and opens in the edit form so you can change what differs. It starts **disabled**, so nobody can book it until you are done: the edit form shows a banner with an **Enable** button, and the `⋯` menu on the list has one too. The original is untouched; bookings and invite links are not copied.
+**Duplicate** in an event type's `⋯` menu creates a copy with every setting: duration, buffers, notice, location, confirmation and visibility, weekly availability and date overrides, calendar selection, booking limits, resources, and for team event types the member priorities and watchers. The copy is titled "*Title* (copy)" under the slug `<slug>-copy` (or `-copy-2`, `-copy-3`, ... when taken) and opens in the edit form so you can change what differs. It starts **disabled**, so nobody can book it until you are done: the edit form shows a banner with an **Enable** button, and the action row on the list has one too. The original is untouched; bookings and invite links are not copied.
 
 ## Visibility
 
