@@ -23,8 +23,9 @@ const SUPPORTED_LANGS: &[(&str, &str, &str)] = &[
     ("pl", "Polski", include_str!("../i18n/pl/main.ftl")),
     ("de", "Deutsch", include_str!("../i18n/de/main.ftl")),
     // German addressing the reader as "Sie". Never picked from a browser's
-    // Accept-Language (which only says "de"): a user chooses it in Profile &
-    // Settings, and it falls back to "de" for any key it lacks.
+    // Accept-Language alone (which only says "de"): a user chooses it in
+    // Profile & Settings, or the admin makes it the instance's German for
+    // visitors (`detect_from_headers`). Falls back to "de" for a missing key.
     (
         "de-formal",
         "Deutsch (Sie)",
@@ -153,10 +154,21 @@ pub fn detect_from_accept_language(header: Option<&str>) -> &'static str {
     DEFAULT_LANG
 }
 
-/// Convenience: pull `Accept-Language` from a `HeaderMap`.
+/// Request header the web layer sets (after stripping any copy the client
+/// sent) when the instance addresses German-speaking visitors as "Sie"
+/// (`auth_config.german_formal`). Read only by `detect_from_headers`.
+pub const GERMAN_FORMAL_HEADER: &str = "x-calrs-german-formal";
+
+/// Convenience: pull `Accept-Language` from a `HeaderMap`. A browser asking
+/// for German gets the formal register when the instance chose it (see
+/// `GERMAN_FORMAL_HEADER`); a user's saved language is never rewritten.
 pub fn detect_from_headers(headers: &HeaderMap) -> &'static str {
     let header = headers.get("accept-language").and_then(|v| v.to_str().ok());
-    detect_from_accept_language(header)
+    let lang = detect_from_accept_language(header);
+    if lang == "de" && headers.contains_key(GERMAN_FORMAL_HEADER) {
+        return "de-formal";
+    }
+    lang
 }
 
 /// Whether a given language code matches one of the bundled locales.
@@ -578,6 +590,27 @@ mod tests {
         assert_eq!(detect_from_accept_language(Some("de-formal")), "de");
     }
 
+    /// The instance setting (carried by `GERMAN_FORMAL_HEADER`) turns a
+    /// browser's German into the formal register, and nothing else: other
+    /// languages and a user's saved preference are left alone.
+    #[test]
+    fn instance_setting_turns_browser_german_formal() {
+        let headers = |accept: &str, formal: bool| {
+            let mut h = HeaderMap::new();
+            h.insert("accept-language", accept.parse().unwrap());
+            if formal {
+                h.insert(GERMAN_FORMAL_HEADER, "1".parse().unwrap());
+            }
+            h
+        };
+        assert_eq!(detect_from_headers(&headers("de-DE", false)), "de");
+        assert_eq!(detect_from_headers(&headers("de-DE", true)), "de-formal");
+        assert_eq!(detect_from_headers(&headers("de-CH,en", true)), "de-formal");
+        assert_eq!(detect_from_headers(&headers("fr-FR,de", true)), "fr");
+        assert_eq!(resolve(Some("de"), &headers("de-DE", true)), "de");
+        assert_eq!(resolve(None, &headers("de-DE", true)), "de-formal");
+    }
+
     #[test]
     fn formal_german_is_a_selectable_locale() {
         assert!(is_supported("de-formal"));
@@ -720,8 +753,13 @@ mod tests {
         ];
         let informal = message_values("de");
         let formal = message_values("de-formal");
+        // Values that name the informal register rather than use it.
+        const NAMES_THE_REGISTER: &[&str] = &["admin-german-formal-du"];
         let mut problems = Vec::new();
         for (id, de_value) in &informal {
+            if NAMES_THE_REGISTER.contains(id) {
+                continue;
+            }
             let (value, origin) = match formal.get(id) {
                 Some(v) => (v.as_str(), "de-formal"),
                 None => (
