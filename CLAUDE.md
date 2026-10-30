@@ -465,7 +465,7 @@ When adding a new migration:
 
 ### Localization (Fluent)
 
-calrs ships with translations for English, French, Spanish, Polish, German, Italian, Estonian, Brazilian Portuguese and Dutch. Source files live under `i18n/{lang}/main.ftl` and are embedded in the binary via `include_str!` (no runtime files). The loader, language detection, and minijinja `t()` global are in `src/i18n.rs`. Templates use `{{ t("message-id", arg=value) }}` and the active language is injected into the rendering context as `lang` by the calling handler.
+calrs ships with translations for English, French, Spanish, Polish, German, Italian, Estonian, Brazilian Portuguese and Dutch, plus German in the formal register (`de-formal`, "Deutsch (Sie)"). Source files live under `i18n/{lang}/main.ftl` and are embedded in the binary via `include_str!` (no runtime files). The loader, language detection, and minijinja `t()` global are in `src/i18n.rs`. Templates use `{{ t("message-id", arg=value) }}` and the active language is injected into the rendering context as `lang` by the calling handler.
 
 Both the guest side and the host side (dashboard, settings, forms, admin panel, auth pages) render through Fluent, including the bare error responses the booking flow returns without page chrome. **All nine locales are complete at 1267 keys**, held there by a test; the per-key English fallback still exists but nothing currently uses it.
 
@@ -479,7 +479,9 @@ Host, team member and watcher emails use the recipient's saved `users.language`,
 
 Three helpers stay English on purpose: the CSRF rejection, the 500 page, and the OIDC failure. They live in helpers called from ~240 sites with no `lang` in scope, and they are diagnostics rather than flow messages.
 
-Every locale except French addresses the reader informally, matching what the earliest translations chose: du, tu (Italian), tú, ty, você, sa, je. French uses "vous" throughout, the usual register for French software; keep new French strings formal so the file stays consistent. The captcha strings in German are the one leftover in the formal register.
+Every locale except French addresses the reader informally, matching what the earliest translations chose: du, tu (Italian), tú, ty, você, sa, je. French uses "vous" throughout, the usual register for French software; keep new French strings formal so the file stays consistent.
+
+**Formal German (`de-formal`).** B2B deployments in German-speaking countries address customers as "Sie", so German ships twice: `de` (du) and `de-formal` (Sie, labelled "Deutsch (Sie)"). `de-formal` is an overlay: it only carries the messages that address the reader (about 200), every other key is read from `de`. A browser never selects it (`Accept-Language` only says `de`): a user picks it in Profile & Settings, which sets their dashboard and emails, and with "Always my language" their public pages, so the bookings made there store `de-formal` and the guest emails follow. `html_lang` declares it as `de`. A key it lacks falls back to `de`, then English (`parent_lang`). When you add a German string that addresses the reader, add its "Sie" form to `de-formal`; other German strings need nothing there. `german_formal_addresses_the_reader_formally` checks what a "Sie" reader actually sees (the override, else the inherited `de` text) and fails on any du/dich/dir/dein, du-only verb form or informal imperative ("Wähle" instead of "Wählen Sie"); `german_formal_overrides_match_german` fails on an override whose key is gone from `de`, whose placeables differ, or which merely copies `de`.
 
 **Where `lang` comes from on host pages.** The `AuthUser` and `AdminUser` extractors resolve it once, in `src/auth.rs`, from the user's saved preference then `Accept-Language`. A dashboard handler passes `lang => auth_user.lang` and nothing else. Pre-login pages (login, register) have no user row, so they call `i18n::detect_from_headers` directly.
 

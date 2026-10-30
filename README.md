@@ -198,7 +198,7 @@ Each team member's CalDAV calendars are checked for conflicts. The availability 
 
 ### Localization
 
-- **Multi-language UI**: the whole application, guest side and host side, in English, French, Spanish, Polish, German, Italian, Estonian, Brazilian Portuguese and Dutch. Strings are managed via [Fluent](https://projectfluent.org/) and embedded in the binary at compile time, so no runtime files to ship
+- **Multi-language UI**: the whole application, guest side and host side, in English, French, Spanish, Polish, German (informal "du" and formal "Sie"), Italian, Estonian, Brazilian Portuguese and Dutch. Strings are managed via [Fluent](https://projectfluent.org/) and embedded in the binary at compile time, so no runtime files to ship
 - **Automatic language detection**: guests get their browser's language (RFC 7231 `Accept-Language` with q-weights). Authenticated users can override the choice in **Profile & Settings**
 - **Community-driven translations**: contributed by pull request, no separate platform to sign up for. See [Contributing a translation](#contributing-a-translation)
 
@@ -646,6 +646,8 @@ Contributing code? Start with [ARCHITECTURE.md](ARCHITECTURE.md): which file own
 
 calrs ships with nine complete translations: English, French, Spanish, Polish, German, Italian, Estonian, Brazilian Portuguese and Dutch. Strings live in [Fluent](https://projectfluent.org/) `.ftl` files under `i18n/` and are embedded in the binary at compile time, so there are no runtime translation files to deploy.
 
+German comes in two registers: **Deutsch** addresses the reader as "du", **Deutsch (Sie)** as "Sie", as most businesses in Germany, Austria and Switzerland address their customers. Browsers only ask for "German", so visitors get "du" unless the host chooses otherwise: pick *Deutsch (Sie)* as your language in Profile & Settings and set your public booking pages to *Always my language*. Your pages, the bookings made on them and every email to those guests then use "Sie".
+
 Every locale carries all 1051 message ids. A test holds them there, so a release cannot ship a half-translated language.
 
 ### Translation quality
@@ -703,7 +705,7 @@ This is fine, and it is how five of the current locales started. It is also why 
 
 - **Fluent syntax is easy to break.** A placeable such as `{ $count }` must survive verbatim, including the spaces. A literal brace has to be written `{"{"}`, because a bare `{` starts a placeable. There are no backslash escapes: a newline is `{"\u000A"}`, not `\n`.
 - **Plurals are not a translation of English plurals.** English selects two forms; Polish selects three for integers. Copying the English `one`/`other` shape into Polish produces text that reads wrong at 2 and at 5. Write the categories your language actually uses.
-- **Register drifts.** All locales here address the reader informally (du, tu, tú, ty, você, sa). Models default to the formal register in German and Spanish unless told otherwise, and the result is a page that switches politeness level halfway down.
+- **Register drifts.** All locales here address the reader informally (du, tu, tú, ty, você, sa), except French (vous) and the separate formal German file `i18n/de-formal/` (Sie). A German string that addresses the reader also needs its "Sie" form in `i18n/de-formal/` (an overlay on `de`; the tests flag a missing one). Models default to the formal register in German and Spanish unless told otherwise, and the result is a page that switches politeness level halfway down.
 
 The test suite checks structure, not meaning. It will catch a missing key, a broken placeable and a missing plural category. It cannot tell you that a sentence is stilted, that a term is wrong for your industry, or that a word is right in Portugal and wrong in Brazil. Say in the pull request description if a translation is machine-seeded, so reviewers know what they are reading.
 
