@@ -148,6 +148,10 @@ pub struct AppState {
     /// Strict baseline CSP served on every non-booking page regardless of
     /// captcha configuration.
     pub csp_baseline: String,
+    /// German-speaking visitors are addressed as "Sie" (`de-formal`) rather
+    /// than "du" (`auth_config.german_formal`). Applied to each request by
+    /// `german_formal_middleware`; updated on admin save.
+    pub german_formal: std::sync::atomic::AtomicBool,
 }
 
 // --- CSRF protection (double-submit cookie pattern) ---
@@ -549,6 +553,38 @@ fn is_booking_form_path(path: &str) -> bool {
     path.ends_with("/book")
 }
 
+/// Load `auth_config.german_formal`; off when unset or unreadable.
+pub(crate) async fn load_german_formal(pool: &SqlitePool) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT german_formal FROM auth_config WHERE id = 'singleton'")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|v| v != 0)
+}
+
+/// Tell `i18n::detect_from_headers` whether a browser asking for German gets
+/// the formal register. The marker header is internal: a copy sent by the
+/// client is always removed first, so only the instance setting decides.
+async fn german_formal_middleware(
+    State(state): State<Arc<AppState>>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let headers = request.headers_mut();
+    headers.remove(crate::i18n::GERMAN_FORMAL_HEADER);
+    if state
+        .german_formal
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        headers.insert(
+            crate::i18n::GERMAN_FORMAL_HEADER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    next.run(request).await
+}
+
 async fn csp_middleware(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -599,6 +635,7 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
     let initial_captcha = captcha::load_captcha_config(&pool, &secret_key).await;
     let initial_meeting = meeting::load_config(&pool, &secret_key).await;
     let initial_csp = build_csp(&initial_captcha);
+    let initial_german_formal = load_german_formal(&pool).await;
 
     let state = Arc::new(AppState {
         pool,
@@ -614,6 +651,7 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
         meeting_config: tokio::sync::RwLock::new(initial_meeting),
         csp: tokio::sync::RwLock::new(initial_csp),
         csp_baseline: build_csp(&None),
+        german_formal: std::sync::atomic::AtomicBool::new(initial_german_formal),
     });
 
     Router::new()
@@ -956,6 +994,10 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             csp_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            german_formal_middleware,
         ))
         .with_state(state)
 }
