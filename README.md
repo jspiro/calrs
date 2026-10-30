@@ -648,7 +648,7 @@ calrs ships with nine complete translations: English, French, Spanish, Polish, G
 
 German comes in two registers: **Deutsch** addresses the reader as "du", **Deutsch (Sie)** as "Sie", as most businesses in Germany, Austria and Switzerland address their customers. Browsers only ask for "German", so visitors get "du" unless the host chooses otherwise: pick *Deutsch (Sie)* as your language in Profile & Settings and set your public booking pages to *Always my language*. Your pages, the bookings made on them and every email to those guests then use "Sie".
 
-Every locale carries all 1051 message ids. A test holds them there, so a release cannot ship a half-translated language.
+Each of these nine locales carries all 1267 message ids. A test holds them there, so a release cannot ship a half-translated language. Formal German is the exception by design: `i18n/de-formal/` is an overlay on `de` that only carries the messages addressing the reader and reads every other message from `de`. Do not copy unchanged German messages into it; a test rejects an override identical to `de`.
 
 ### Translation quality
 
@@ -695,7 +695,7 @@ Four steps, and the order matters. Doing them out of order fails the build in a 
 3. **Declare its plural categories.** Add the locale to the `required` table in `plural_messages_carry_the_locale_categories` in `src/i18n.rs`. Most languages need `one, other`; Polish needs `one, few, many`. The [CLDR plural rules chart](https://www.unicode.org/cldr/charts/47/supplemental/language_plural_rules.html) is the reference.
 4. Run `cargo test i18n::`
 
-Step 1 comes before step 2 for a reason: the coverage test demands every key the moment a locale appears in `SUPPORTED_LANGS`, so registering an empty file fails with 1051 errors at once.
+Step 1 comes before step 2 for a reason: the coverage test demands every key the moment a locale appears in `SUPPORTED_LANGS`, so registering an empty file fails with 1267 errors at once.
 
 That is the whole change on the calrs side. The language then appears in the **Profile & Settings** dropdown and is matched against `Accept-Language` automatically.
 
