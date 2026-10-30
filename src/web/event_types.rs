@@ -1177,7 +1177,10 @@ pub(super) async fn update_event_type(
                 &auth_user,
                 &crate::i18n::translate(auth_user.lang, key, None),
                 &form,
-                FormTarget::EditPersonal { et_id: &et_id },
+                FormTarget::EditPersonal {
+                    et_id: &et_id,
+                    slug: &slug,
+                },
             )
             .await
             .into_response()
@@ -1212,7 +1215,10 @@ pub(super) async fn update_event_type(
                 &auth_user,
                 &crate::i18n::translate(auth_user.lang, "form-error-event-type-slug-taken", None),
                 &form,
-                FormTarget::EditPersonal { et_id: &et_id },
+                FormTarget::EditPersonal {
+                    et_id: &et_id,
+                    slug: &slug,
+                },
             )
             .await
             .into_response();
@@ -1232,7 +1238,10 @@ pub(super) async fn update_event_type(
             &auth_user,
             &crate::i18n::translate(auth_user.lang, "form-error-location-required", None),
             &form,
-            FormTarget::EditPersonal { et_id: &et_id },
+            FormTarget::EditPersonal {
+                et_id: &et_id,
+                slug: &slug,
+            },
         )
         .await
         .into_response();
@@ -1252,7 +1261,10 @@ pub(super) async fn update_event_type(
             &auth_user,
             &err,
             &form,
-            FormTarget::EditPersonal { et_id: &et_id },
+            FormTarget::EditPersonal {
+                et_id: &et_id,
+                slug: &slug,
+            },
         )
         .await
         .into_response();
@@ -1324,7 +1336,10 @@ pub(super) async fn update_event_type(
             &state,
             &auth_user,
             &form,
-            FormTarget::EditPersonal { et_id: &et_id },
+            FormTarget::EditPersonal {
+                et_id: &et_id,
+                slug: &slug,
+            },
             &e,
         )
         .await;
@@ -1893,9 +1908,18 @@ pub(super) fn slug_taken_key(error: &sqlx::Error) -> Option<&'static str> {
 #[derive(Clone, Copy)]
 enum FormTarget<'a> {
     NewPersonal,
-    EditPersonal { et_id: &'a str },
-    NewTeam { team_id: &'a str },
-    EditTeam { team_id: &'a str, et_id: &'a str },
+    EditPersonal {
+        et_id: &'a str,
+        slug: &'a str,
+    },
+    NewTeam {
+        team_id: &'a str,
+    },
+    EditTeam {
+        team_id: &'a str,
+        et_id: &'a str,
+        slug: &'a str,
+    },
 }
 
 async fn render_event_type_form_error(
@@ -1941,7 +1965,7 @@ async fn render_event_type_form_error(
         _ => Vec::new(),
     };
     let priority_members = match target {
-        FormTarget::EditTeam { team_id, et_id } => {
+        FormTarget::EditTeam { team_id, et_id, .. } => {
             form_priority_members(pool, team_id, et_id).await
         }
         _ => Vec::new(),
@@ -1951,6 +1975,12 @@ async fn render_event_type_form_error(
             form_busy_calendars(pool, &user.id).await
         }
         _ => Vec::new(),
+    };
+    // The stored slug: what the member priority buttons post to, since they
+    // save at once, before the form (and its possibly changed slug) is saved.
+    let original_slug = match target {
+        FormTarget::EditPersonal { slug, .. } | FormTarget::EditTeam { slug, .. } => slug,
+        _ => "",
     };
     let dg_eligible_users = match target {
         FormTarget::EditPersonal { .. } => form_dg_eligible_users(pool, &user.id).await,
@@ -2034,6 +2064,8 @@ async fn render_event_type_form_error(
             calendars => calendars,
             selected_calendar_ids => form.calendar_ids.as_deref().unwrap_or(""),
             owner_username => user.username.as_deref().unwrap_or(""),
+            original_slug => original_slug,
+            form_member_priorities => form.member_priorities.as_str(),
             dg_eligible_users => dg_eligible_users,
             tz_options => timezone_options(form.timezone.as_deref().unwrap_or(&auth_user.user.timezone), auth_user.lang),
             error => error,
@@ -2923,6 +2955,7 @@ pub(super) async fn update_group_event_type(
                 FormTarget::EditTeam {
                     team_id: &team_id,
                     et_id: &et_id,
+                    slug: &slug,
                 },
             )
             .await
@@ -2965,6 +2998,7 @@ pub(super) async fn update_group_event_type(
                 FormTarget::EditTeam {
                     team_id: &team_id,
                     et_id: &et_id,
+                    slug: &slug,
                 },
             )
             .await
@@ -2988,6 +3022,7 @@ pub(super) async fn update_group_event_type(
             FormTarget::EditTeam {
                 team_id: &team_id,
                 et_id: &et_id,
+                slug: &slug,
             },
         )
         .await
@@ -3011,6 +3046,7 @@ pub(super) async fn update_group_event_type(
             FormTarget::EditTeam {
                 team_id: &team_id,
                 et_id: &et_id,
+                slug: &slug,
             },
         )
         .await
@@ -3086,6 +3122,7 @@ pub(super) async fn update_group_event_type(
             FormTarget::EditTeam {
                 team_id: &team_id,
                 et_id: &et_id,
+                slug: &slug,
             },
             &e,
         )

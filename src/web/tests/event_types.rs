@@ -1513,7 +1513,7 @@ async fn team_edit_error_keeps_mode_watchers_and_members() {
             &et_form_body(
                 csrf,
                 &[
-                    ("slug", "team-sync"),
+                    ("slug", "renamed-sync"),
                     ("duration_min", "-5"),
                     ("scheduling_mode", "collective"),
                     ("watcher_team_ids", &watcher),
@@ -1535,6 +1535,13 @@ async fn team_edit_error_keeps_mode_watchers_and_members() {
         "watchers kept"
     );
     assert!(page.contains("id=\"priority-card\""), "member card shown");
+    // The posted slug was invalid, so nothing was renamed: the member
+    // buttons, which save at once, must still target the stored slug.
+    assert!(
+        page.contains("/team-sync/priority/"),
+        "priority URL uses the stored slug"
+    );
+    assert!(!page.contains("/renamed-sync/priority/"));
     let duration: i32 = sqlx::query_scalar("SELECT duration_min FROM event_types WHERE id = ?")
         .bind(&team_et_id)
         .fetch_one(&pool)
@@ -1607,6 +1614,10 @@ async fn personal_edit_error_keeps_reminder_guests_and_calendars() {
 async fn create_error_keeps_the_chosen_team() {
     let (app, pool, session, _) = setup_test_app().await;
     let (team_id, _) = seed_team_event_type(&pool).await;
+    let member: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'testuser'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
     let csrf = "csrf-create-team-context";
     let response = app
@@ -1614,7 +1625,14 @@ async fn create_error_keeps_the_chosen_team() {
             "/dashboard/event-types/new",
             &session,
             csrf,
-            &et_form_body(csrf, &[("team_id", &team_id), ("duration_min", "-5")]),
+            &et_form_body(
+                csrf,
+                &[
+                    ("team_id", &team_id),
+                    ("duration_min", "-5"),
+                    ("member_priorities", &format!("{member}:3")),
+                ],
+            ),
         ))
         .await
         .unwrap();
@@ -1622,5 +1640,10 @@ async fn create_error_keeps_the_chosen_team() {
     assert_eq!(response.status(), 200);
     let page = body_string(response).await;
     assert_form_error(&page, "form-error-event-type-duration", "create");
+    // The member card starts from the posted priorities, not the defaults.
+    assert!(
+        page.contains(&format!("\"{member}:3\"")),
+        "posted priorities echoed"
+    );
     assert!(page.contains(&format!("<option value=\"{team_id}\" selected>")));
 }
