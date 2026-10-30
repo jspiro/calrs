@@ -1802,21 +1802,33 @@ async fn event_type_write_failed(
     editing: bool,
     error: &sqlx::Error,
 ) -> axum::response::Response {
-    let unique = error
-        .as_database_error()
-        .is_some_and(|e| e.is_unique_violation());
-    if !unique {
+    let Some(key) = slug_taken_key(error) else {
         return internal_error_response("save event type", error);
-    }
+    };
     render_event_type_form_error(
         state,
         auth_user,
-        &crate::i18n::translate(auth_user.lang, "form-error-event-type-slug-taken", None),
+        &crate::i18n::translate(auth_user.lang, key, None),
         form,
         editing,
     )
     .await
     .into_response()
+}
+
+/// The form error key for a write refused by one of the slug constraints:
+/// the team message when the `(team_id, slug)` index refused it, the account
+/// one otherwise. `None` for any other error.
+pub(super) fn slug_taken_key(error: &sqlx::Error) -> Option<&'static str> {
+    let db = error.as_database_error()?;
+    if !db.is_unique_violation() {
+        return None;
+    }
+    if db.message().contains("event_types.team_id") {
+        Some("form-error-event-type-slug-taken-team")
+    } else {
+        Some("form-error-event-type-slug-taken")
+    }
 }
 
 async fn render_event_type_form_error(

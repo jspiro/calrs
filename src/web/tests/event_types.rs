@@ -1436,3 +1436,50 @@ async fn migration_074_renames_duplicate_team_slugs_before_indexing() {
     .unwrap();
     assert!(index.is_some());
 }
+
+/// A write refused by a slug constraint (a slug taken between the pre-check
+/// and the write) maps to the matching form message; anything else does not,
+/// so the handler returns a 500 instead of reporting a save.
+#[tokio::test]
+async fn a_refused_write_maps_to_the_matching_slug_message() {
+    let pool = setup_test_db().await;
+    seed_test_data(&pool).await;
+    let (team_id, _) = seed_team_event_type(&pool).await;
+    let other_account = user_with_account(&pool, "racer@x").await;
+    let account: String =
+        sqlx::query_scalar("SELECT account_id FROM event_types WHERE slug = 'team-sync'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let team_dup = sqlx::query(
+        "INSERT INTO event_types (id, account_id, slug, title, duration_min, team_id) VALUES ('r1', ?, 'team-sync', 'R', 30, ?)",
+    )
+    .bind(&other_account)
+    .bind(&team_id)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        crate::web::event_types::slug_taken_key(&team_dup),
+        Some("form-error-event-type-slug-taken-team")
+    );
+
+    let account_dup = sqlx::query(
+        "INSERT INTO event_types (id, account_id, slug, title, duration_min) VALUES ('r2', ?, 'test-meeting', 'R', 30)",
+    )
+    .bind(&account)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        crate::web::event_types::slug_taken_key(&account_dup),
+        Some("form-error-event-type-slug-taken")
+    );
+
+    let other = sqlx::query("INSERT INTO event_types (id) VALUES ('r3')")
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(crate::web::event_types::slug_taken_key(&other), None);
+}
