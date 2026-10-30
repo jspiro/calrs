@@ -767,19 +767,7 @@ mod tests {
                     "inherited from de, add a de-formal override",
                 ),
             };
-            // Drop placeables and HTML tags.
-            let mut text = String::new();
-            let mut depth = (0, 0);
-            for c in value.chars() {
-                match c {
-                    '{' => depth.0 += 1,
-                    '}' => depth.0 -= 1,
-                    '<' => depth.1 += 1,
-                    '>' => depth.1 -= 1,
-                    _ if depth == (0, 0) => text.push(c),
-                    _ => {}
-                }
-            }
+            let text = reader_text(value);
             let mut sentence_start = true;
             let mut word = String::new();
             for c in text.chars().chain(std::iter::once(' ')) {
@@ -1193,6 +1181,97 @@ mod tests {
             "de-formal overrides out of step with de:\n{}",
             problems.join("\n")
         );
+    }
+
+    /// The words a reader sees in a Fluent value, for the register guard:
+    /// placeables (`{ $name }`) and HTML tags are dropped, but the text of each
+    /// variant of a select expression (`{ $count -> [one] … *[other] … }`) is
+    /// kept, since one of them is what the reader gets.
+    fn reader_text(value: &str) -> String {
+        enum Mode {
+            Text,
+            Expr,
+            Variants,
+        }
+        // A continuation line starting a new variant: `[key]` or `*[key]`.
+        let starts_variant = |rest: &[char]| {
+            let rest: String = rest.iter().collect();
+            let rest = rest.trim_start_matches([' ', '\t']);
+            rest.starts_with('[') || rest.starts_with("*[")
+        };
+        let chars: Vec<char> = value.chars().collect();
+        let mut stack = vec![Mode::Text];
+        let mut out = String::new();
+        let mut in_tag = false;
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            match stack.last() {
+                Some(Mode::Text) => match c {
+                    '{' => stack.push(Mode::Expr),
+                    // Closes the select expression this variant belongs to.
+                    '}' if stack.len() > 1 => {
+                        stack.truncate(stack.len() - 2);
+                        out.push(' ');
+                    }
+                    '\n' if stack.len() > 1 && starts_variant(&chars[i + 1..]) => {
+                        stack.pop();
+                        out.push(' ');
+                    }
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    _ if !in_tag => out.push(c),
+                    _ => {}
+                },
+                Some(Mode::Expr) => match c {
+                    '-' if chars.get(i + 1) == Some(&'>') => {
+                        stack.pop();
+                        stack.push(Mode::Variants);
+                        i += 1;
+                    }
+                    '{' => stack.push(Mode::Expr),
+                    '}' => {
+                        stack.pop();
+                    }
+                    _ => {}
+                },
+                Some(Mode::Variants) => match c {
+                    '[' => {
+                        while i < chars.len() && chars[i] != ']' {
+                            i += 1;
+                        }
+                        stack.push(Mode::Text);
+                        out.push(' ');
+                    }
+                    '}' => {
+                        stack.pop();
+                    }
+                    _ => {}
+                },
+                None => break,
+            }
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn reader_text_keeps_variant_text_and_drops_placeables() {
+        assert_eq!(
+            reader_text("Hallo { $name }, <strong>willkommen</strong>"),
+            "Hallo , willkommen"
+        );
+        let plural = reader_text(
+            "{ $count ->\n[one] Du hast { $count } Buchung.\n*[other] Du hast { $count } Buchungen.\n}",
+        );
+        assert!(plural.contains("Du hast  Buchung."), "{plural:?}");
+        assert!(plural.contains("Du hast  Buchungen."), "{plural:?}");
+        assert!(
+            !plural.contains("count") && !plural.contains("other"),
+            "{plural:?}"
+        );
+        // Text after the select expression is still read.
+        assert!(reader_text("{ $n -> [one] a *[other] b } danach").ends_with("danach"));
     }
 
     /// Message id -> value source (continuation lines included) of a locale.
