@@ -675,30 +675,11 @@ pub(super) async fn create_event_type(
     // Check if a team_id was provided and it's non-empty
     let team_id = form.team_id.as_deref().filter(|s| !s.trim().is_empty());
 
-    // Check uniqueness — scope to team_id when creating a team event type, otherwise to account_id
-    let existing: Option<(String,)> = if let Some(tid) = team_id {
-        sqlx::query_as("SELECT id FROM event_types WHERE team_id = ? AND slug = ?")
-            .bind(tid)
-            .bind(&slug)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None)
-    } else {
-        sqlx::query_as(
-            "SELECT id FROM event_types WHERE account_id = ? AND slug = ? AND team_id IS NULL",
-        )
-        .bind(&account_id)
-        .bind(&slug)
-        .fetch_optional(&state.pool)
-        .await
-        .unwrap_or(None)
-    };
-
-    if existing.is_some() {
+    if let Some(key) = slug_conflict(&state.pool, &slug, &account_id, team_id, None).await {
         return render_event_type_form_error(
             &state,
             &auth_user,
-            &crate::i18n::translate(auth_user.lang, "form-error-event-type-slug-taken", None),
+            &crate::i18n::translate(auth_user.lang, key, None),
             &form,
             false,
         )
@@ -790,7 +771,7 @@ pub(super) async fn create_event_type(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    let _ = sqlx::query(
+    let written = sqlx::query(
         "INSERT INTO event_types (id, account_id, slug, title, description, duration_min, slot_interval_min, buffer_before, buffer_after, min_notice_min, requires_confirmation, location_type, location_value, team_id, created_by_user_id, reminder_minutes, visibility, max_additional_guests, default_calendar_view, first_slot_only, timezone, cancel_notice_min, reschedule_notice_min, meeting_pattern_override, sms_phone_mode, booking_horizon_days)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
@@ -822,6 +803,9 @@ pub(super) async fn create_event_type(
     .bind(booking_horizon_days)
     .execute(&state.pool)
     .await;
+    if let Err(e) = written {
+        return event_type_write_failed(&state, &auth_user, &form, false, &e).await;
+    }
     save_pending_settings(&state.pool, &et_id, &form, true).await;
 
     tracing::info!(slug = %slug, user = %auth_user.user.email, "event type created");
@@ -1429,7 +1413,7 @@ pub(super) async fn update_event_type(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    let _ = sqlx::query(
+    let written = sqlx::query(
         "UPDATE event_types SET slug = ?, title = ?, description = ?, duration_min = ?, slot_interval_min = ?, buffer_before = ?, buffer_after = ?, min_notice_min = ?, requires_confirmation = ?, location_type = ?, location_value = ?, reminder_minutes = ?, visibility = ?, max_additional_guests = ?, scheduling_mode = ?, default_calendar_view = ?, first_slot_only = ?, timezone = ?, cancel_notice_min = ?, reschedule_notice_min = ?, meeting_pattern_override = ?, sms_phone_mode = ?, booking_horizon_days = ? WHERE id = ?",
     )
     .bind(&new_slug)
@@ -1458,6 +1442,9 @@ pub(super) async fn update_event_type(
     .bind(&et_id)
     .execute(&state.pool)
     .await;
+    if let Err(e) = written {
+        return event_type_write_failed(&state, &auth_user, &form, true, &e).await;
+    }
     save_pending_settings(&state.pool, &et_id, &form, false).await;
 
     // Update availability rules: delete old, insert new. Pass the user's
@@ -1767,6 +1754,69 @@ pub(super) async fn delete_event_type(
     tracing::info!(event_type_id = %et_id, user = %auth_user.user.email, "event type deleted");
 
     Redirect::to("/dashboard/event-types").into_response()
+}
+
+/// The form error key for `slug` when another event type already holds it,
+/// `None` when it is free. The schema keeps slugs unique per account
+/// (personal and team event types alike, since a team event type is stored
+/// under its creator's account) and per team (#313). `exclude_id` is the event
+/// type being edited.
+async fn slug_conflict(
+    pool: &SqlitePool,
+    slug: &str,
+    account_id: &str,
+    team_id: Option<&str>,
+    exclude_id: Option<&str>,
+) -> Option<&'static str> {
+    let taken = |scope: &'static str, value: String| async move {
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT 1 FROM event_types WHERE {scope} = ? AND slug = ? AND id IS NOT ?"
+        ))
+        .bind(value)
+        .bind(slug)
+        .bind(exclude_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+    };
+    if let Some(tid) = team_id {
+        if taken("team_id", tid.to_string()).await {
+            return Some("form-error-event-type-slug-taken-team");
+        }
+    }
+    if taken("account_id", account_id.to_string()).await {
+        return Some("form-error-event-type-slug-taken");
+    }
+    None
+}
+
+/// Response for a failed event type INSERT or UPDATE: a slug taken between
+/// `slug_conflict` and the write re-renders the form, anything else is a 500.
+/// Either way nothing is reported as saved.
+async fn event_type_write_failed(
+    state: &AppState,
+    auth_user: &crate::auth::AuthUser,
+    form: &EventTypeForm,
+    editing: bool,
+    error: &sqlx::Error,
+) -> axum::response::Response {
+    let unique = error
+        .as_database_error()
+        .is_some_and(|e| e.is_unique_violation());
+    if !unique {
+        return internal_error_response("save event type", error);
+    }
+    render_event_type_form_error(
+        state,
+        auth_user,
+        &crate::i18n::translate(auth_user.lang, "form-error-event-type-slug-taken", None),
+        form,
+        editing,
+    )
+    .await
+    .into_response()
 }
 
 async fn render_event_type_form_error(
@@ -2211,21 +2261,15 @@ pub(super) async fn create_group_event_type(
         }
     };
 
-    // Check uniqueness within the team
-    let existing: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM event_types WHERE team_id = ? AND slug = ?")
-            .bind(&team_id)
-            .bind(&slug)
-            .fetch_optional(&state.pool)
-            .await
-            .unwrap_or(None);
-
-    if existing.is_some() {
-        return Html(crate::i18n::translate(
-            auth_user.lang,
-            "form-error-event-type-slug-taken-team",
-            None,
-        ))
+    if let Some(key) = slug_conflict(&state.pool, &slug, &account_id, Some(&team_id), None).await {
+        return render_event_type_form_error(
+            &state,
+            &auth_user,
+            &crate::i18n::translate(auth_user.lang, key, None),
+            &form,
+            false,
+        )
+        .await
         .into_response();
     }
 
@@ -2282,7 +2326,7 @@ pub(super) async fn create_group_event_type(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    let _ = sqlx::query(
+    let written = sqlx::query(
         "INSERT INTO event_types (id, account_id, slug, title, description, duration_min, slot_interval_min, buffer_before, buffer_after, min_notice_min, requires_confirmation, location_type, location_value, team_id, created_by_user_id, default_calendar_view, first_slot_only, timezone, cancel_notice_min, reschedule_notice_min, meeting_pattern_override, sms_phone_mode, booking_horizon_days)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
@@ -2311,6 +2355,9 @@ pub(super) async fn create_group_event_type(
     .bind(booking_horizon_days)
     .execute(&state.pool)
     .await;
+    if let Err(e) = written {
+        return event_type_write_failed(&state, &auth_user, &form, false, &e).await;
+    }
     save_pending_settings(&state.pool, &et_id, &form, true).await;
 
     // Create availability rules. Pass the creating user's profile-default
@@ -2801,25 +2848,28 @@ pub(super) async fn update_group_event_type(
     .await;
     let visibility = form.visibility.as_deref().unwrap_or("public").to_string();
 
-    // Check slug uniqueness within the team if changed
+    // Check slug uniqueness if changed: within the team, and within the
+    // account the event type is stored under (its creator's).
     if new_slug != slug {
-        let existing: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM event_types WHERE team_id = ? AND slug = ?")
-                .bind(&team_id)
-                .bind(&new_slug)
-                .fetch_optional(&state.pool)
+        let owner_account: String =
+            sqlx::query_scalar("SELECT account_id FROM event_types WHERE id = ?")
+                .bind(&et_id)
+                .fetch_one(&state.pool)
                 .await
-                .unwrap_or(None);
-
-        if existing.is_some() {
+                .unwrap_or_default();
+        if let Some(key) = slug_conflict(
+            &state.pool,
+            &new_slug,
+            &owner_account,
+            Some(&team_id),
+            Some(&et_id),
+        )
+        .await
+        {
             return render_event_type_form_error(
                 &state,
                 &auth_user,
-                &crate::i18n::translate(
-                    auth_user.lang,
-                    "form-error-event-type-slug-taken-team",
-                    None,
-                ),
+                &crate::i18n::translate(auth_user.lang, key, None),
                 &form,
                 true,
             )
@@ -2893,7 +2943,7 @@ pub(super) async fn update_group_event_type(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    let _ = sqlx::query(
+    let written = sqlx::query(
         "UPDATE event_types SET slug = ?, title = ?, description = ?, duration_min = ?, slot_interval_min = ?, buffer_before = ?, buffer_after = ?, min_notice_min = ?, requires_confirmation = ?, location_type = ?, location_value = ?, reminder_minutes = ?, visibility = ?, max_additional_guests = ?, scheduling_mode = ?, default_calendar_view = ?, first_slot_only = ?, timezone = ?, cancel_notice_min = ?, reschedule_notice_min = ?, meeting_pattern_override = ?, sms_phone_mode = ?, booking_horizon_days = ? WHERE id = ?",
     )
     .bind(&new_slug)
@@ -2922,6 +2972,9 @@ pub(super) async fn update_group_event_type(
     .bind(&et_id)
     .execute(&state.pool)
     .await;
+    if let Err(e) = written {
+        return event_type_write_failed(&state, &auth_user, &form, true, &e).await;
+    }
     save_pending_settings(&state.pool, &et_id, &form, false).await;
 
     // Update availability rules. Pass the editing user's profile-default
