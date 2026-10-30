@@ -3,7 +3,16 @@
 use super::*;
 
 /// Columns a copy is expected to differ on; every other column must match.
-const OWN_COLUMNS: [&str; 5] = ["id", "slug", "title", "enabled", "created_at"];
+/// `created_by_user_id` and `sms_phone_mode` have tests of their own.
+const OWN_COLUMNS: [&str; 7] = [
+    "id",
+    "slug",
+    "title",
+    "enabled",
+    "created_at",
+    "created_by_user_id",
+    "sms_phone_mode",
+];
 
 const DISABLED_BANNER: &str = "This event type is disabled, so nobody can book it yet.";
 
@@ -205,6 +214,34 @@ async fn duplicate_copies_settings_and_children_and_opens_the_copy() {
     .unwrap();
     assert_eq!(limit, (3, "week".to_string(), 1));
 
+    // The copy is credited to whoever made it.
+    let created_by: Option<String> =
+        sqlx::query_scalar("SELECT created_by_user_id FROM event_types WHERE id = ?")
+            .bind(&copy_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(created_by.as_deref(), Some(user_id.as_str()));
+
+    // Copied child rows get UUID v4 ids like every other primary key.
+    for table in [
+        "availability_rules",
+        "availability_overrides",
+        "booking_frequency_limits",
+    ] {
+        let ids: Vec<String> =
+            sqlx::query_scalar(&format!("SELECT id FROM {table} WHERE event_type_id = ?"))
+                .bind(&copy_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for id in ids {
+            let parsed = uuid::Uuid::parse_str(&id).expect("child id is a UUID");
+            assert_eq!(parsed.get_version_num(), 4, "{table} id {id}");
+            assert_eq!(parsed.to_string(), id, "{table} id is lowercase hyphenated");
+        }
+    }
+
     // The original keeps its children and its slug.
     assert_eq!(count_where(&pool, "availability_rules", &et_id).await, 5);
     assert!(et_id_by_slug(&pool, "test-meeting").await.is_some());
@@ -351,4 +388,128 @@ async fn event_type_count_all(pool: &SqlitePool) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+async fn set_role_and_sms(pool: &SqlitePool, et_id: &str, role: &str, sms_mode: &str) {
+    sqlx::query("UPDATE users SET role = ? WHERE id = (SELECT user_id FROM accounts LIMIT 1)")
+        .bind(role)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE event_types SET sms_phone_mode = ? WHERE id = ?")
+        .bind(sms_mode)
+        .bind(et_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn sms_mode_of(pool: &SqlitePool, slug: &str) -> String {
+    sqlx::query_scalar("SELECT sms_phone_mode FROM event_types WHERE slug = ?")
+        .bind(slug)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn duplicate_by_a_user_who_may_not_enable_sms_starts_with_sms_off() {
+    let (app, pool, session, et_id) = setup_test_app().await;
+    set_role_and_sms(&pool, &et_id, "user", "required").await;
+    let resource_id = insert_resource(&pool, "Lab").await;
+    attach_resource(&pool, &et_id, &resource_id).await;
+
+    post_duplicate(
+        app,
+        "/dashboard/event-types/test-meeting/duplicate",
+        &session,
+    )
+    .await;
+
+    assert_eq!(sms_mode_of(&pool, "test-meeting-copy").await, "off");
+    assert_eq!(sms_mode_of(&pool, "test-meeting").await, "required");
+    // Resources only restrict availability, so the copy keeps them.
+    let copy_id = et_id_by_slug(&pool, "test-meeting-copy").await.unwrap();
+    assert_eq!(
+        count_where(&pool, "event_type_resources", &copy_id).await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn duplicate_keeps_sms_for_an_admin_or_when_all_users_may_enable_it() {
+    let (app, pool, session, et_id) = setup_test_app().await;
+    set_role_and_sms(&pool, &et_id, "admin", "optional").await;
+    post_duplicate(
+        app.clone(),
+        "/dashboard/event-types/test-meeting/duplicate",
+        &session,
+    )
+    .await;
+    assert_eq!(sms_mode_of(&pool, "test-meeting-copy").await, "optional");
+
+    set_role_and_sms(&pool, &et_id, "user", "optional").await;
+    sqlx::query("UPDATE auth_config SET sms_allow_all_users = 1 WHERE id = 'singleton'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    post_duplicate(
+        app,
+        "/dashboard/event-types/test-meeting/duplicate",
+        &session,
+    )
+    .await;
+    assert_eq!(sms_mode_of(&pool, "test-meeting-copy-2").await, "optional");
+}
+
+#[tokio::test]
+async fn enabling_from_the_banner_returns_to_the_edit_form() {
+    let (app, pool, session, _) = setup_test_app().await;
+    post_duplicate(
+        app.clone(),
+        "/dashboard/event-types/test-meeting/duplicate",
+        &session,
+    )
+    .await;
+    let copy_id = et_id_by_slug(&pool, "test-meeting-copy").await.unwrap();
+
+    let page = edit_page(
+        app.clone(),
+        "/dashboard/event-types/test-meeting-copy/edit",
+        &session,
+    )
+    .await;
+    assert!(page.contains(r#"name="then" value="edit""#));
+
+    let csrf = "test-csrf-toggle";
+    let response = app
+        .clone()
+        .oneshot(post_form(
+            "/dashboard/event-types/test-meeting-copy/toggle",
+            &session,
+            csrf,
+            &format!("_csrf={csrf}&then=edit"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        location(&response),
+        "/dashboard/event-types/test-meeting-copy/edit"
+    );
+    assert_eq!(enabled(&pool, &copy_id).await, 1);
+
+    // The list's own toggle, and any other `then`, still land on the list.
+    for body in [format!("_csrf={csrf}"), format!("_csrf={csrf}&then=//evil")] {
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                "/dashboard/event-types/test-meeting-copy/toggle",
+                &session,
+                csrf,
+                &body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(location(&response), "/dashboard/event-types");
+    }
 }
