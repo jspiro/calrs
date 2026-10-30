@@ -1285,6 +1285,10 @@ async fn team_create_refuses_a_slug_taken_in_the_team_on_the_form() {
         page.contains("Checked Meeting"),
         "the form keeps what was typed"
     );
+    assert!(
+        page.contains(&format!("<option value=\"{team_id}\" selected>")),
+        "the team stays selected, so the resubmit creates a team event type"
+    );
     assert_eq!(event_type_count(&pool).await, before);
 }
 
@@ -1482,4 +1486,141 @@ async fn a_refused_write_maps_to_the_matching_slug_message() {
         .await
         .unwrap_err();
     assert_eq!(crate::web::event_types::slug_taken_key(&other), None);
+}
+
+// --- The error re-render keeps every setting of the form it replaces ---
+
+/// A team edit that fails validation re-renders with the posted scheduling
+/// mode, watchers and member card: a resubmit must not turn a collective
+/// event type round-robin or clear its watchers.
+#[tokio::test]
+async fn team_edit_error_keeps_mode_watchers_and_members() {
+    let (app, pool, session, _) = setup_test_app().await;
+    let (team_id, team_et_id) = seed_team_event_type(&pool).await;
+    let watcher = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO teams (id, name, slug, visibility) VALUES (?, 'Watchers', 'watchers', 'public')")
+        .bind(&watcher)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let csrf = "csrf-team-edit-context";
+    let response = app
+        .oneshot(post_form(
+            &format!("/dashboard/group-event-types/{team_id}/team-sync/edit"),
+            &session,
+            csrf,
+            &et_form_body(
+                csrf,
+                &[
+                    ("slug", "team-sync"),
+                    ("duration_min", "-5"),
+                    ("scheduling_mode", "collective"),
+                    ("watcher_team_ids", &watcher),
+                ],
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let page = body_string(response).await;
+    assert_form_error(&page, "form-error-event-type-duration", "team edit");
+    assert!(
+        page.contains("<option value=\"collective\" selected>"),
+        "mode kept"
+    );
+    assert!(
+        page.contains(&format!("id=\"watcher_team_ids\" value=\"{watcher}\"")),
+        "watchers kept"
+    );
+    assert!(page.contains("id=\"priority-card\""), "member card shown");
+    let duration: i32 = sqlx::query_scalar("SELECT duration_min FROM event_types WHERE id = ?")
+        .bind(&team_et_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(duration, 30, "nothing saved");
+}
+
+/// A personal edit that fails validation keeps the reminder, the guest limit
+/// and the calendar selection the user posted.
+#[tokio::test]
+async fn personal_edit_error_keeps_reminder_guests_and_calendars() {
+    let (app, pool, session, _) = setup_test_app().await;
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'testuser'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let source_id = seed_write_source(&pool, &user_id, "https://dav.invalid").await;
+    for cal in ["cal-a", "cal-b"] {
+        sqlx::query("INSERT INTO calendars (id, source_id, href, display_name, is_busy) VALUES (?, ?, ?, ?, 1)")
+            .bind(cal)
+            .bind(&source_id)
+            .bind(format!("/{cal}/"))
+            .bind(cal)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let csrf = "csrf-personal-edit-context";
+    let response = app
+        .oneshot(post_form(
+            "/dashboard/event-types/test-meeting/edit",
+            &session,
+            csrf,
+            &et_form_body(
+                csrf,
+                &[
+                    ("slug", "test-meeting"),
+                    ("duration_min", "-5"),
+                    ("reminder_minutes", "60"),
+                    ("max_additional_guests", "3"),
+                    ("calendar_ids", "cal-a,cal-b"),
+                ],
+            ),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let page = body_string(response).await;
+    assert_form_error(&page, "form-error-event-type-duration", "personal edit");
+    assert!(
+        page.contains("<option value=\"60\" selected>"),
+        "reminder kept"
+    );
+    assert!(
+        page.contains("<option value=\"3\" selected>"),
+        "guest limit kept"
+    );
+    assert!(
+        page.contains("id=\"calendar_ids\" value=\"cal-a,cal-b\""),
+        "calendar selection kept"
+    );
+}
+
+/// A personal-form create aimed at a team that fails validation keeps the
+/// team selected, instead of resubmitting as a personal event type.
+#[tokio::test]
+async fn create_error_keeps_the_chosen_team() {
+    let (app, pool, session, _) = setup_test_app().await;
+    let (team_id, _) = seed_team_event_type(&pool).await;
+
+    let csrf = "csrf-create-team-context";
+    let response = app
+        .oneshot(post_form(
+            "/dashboard/event-types/new",
+            &session,
+            csrf,
+            &et_form_body(csrf, &[("team_id", &team_id), ("duration_min", "-5")]),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    let page = body_string(response).await;
+    assert_form_error(&page, "form-error-event-type-duration", "create");
+    assert!(page.contains(&format!("<option value=\"{team_id}\" selected>")));
 }

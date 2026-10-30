@@ -501,71 +501,11 @@ pub(super) async fn new_event_type_form(
     let user = &auth_user.user;
     let preset = query.get("preset").map(|s| s.as_str()).unwrap_or("");
 
-    // Get teams where the user is a team admin (global admins see all teams).
     // Only team admins can create team event types — regular members see no
     // teams in the dropdown.
-    let groups: Vec<(String, String)> = if user.role == "admin" {
-        sqlx::query_as("SELECT t.id, t.name FROM teams t ORDER BY t.name")
-            .fetch_all(&state.pool)
-            .await
-            .unwrap_or_default()
-    } else {
-        sqlx::query_as(
-            "SELECT t.id, t.name FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ? AND tm.role = 'admin' ORDER BY t.name",
-        )
-        .bind(&user.id)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default()
-    };
-
-    // Fetch members for each team (for client-side priority card)
-    let mut groups_ctx: Vec<minijinja::Value> = Vec::new();
-    for (id, name) in &groups {
-        let team_members: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-            "SELECT u.id, u.name, u.avatar_path, u.timezone FROM users u \
-             JOIN team_members tm ON tm.user_id = u.id \
-             WHERE tm.team_id = ? AND u.enabled = 1 ORDER BY u.name",
-        )
-        .bind(id)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default();
-        let members_ctx: Vec<minijinja::Value> = team_members
-            .iter()
-            .map(|(uid, uname, ap, tz)| {
-                context! {
-                    user_id => uid,
-                    name => uname,
-                    has_avatar => ap.is_some(),
-                    initials => compute_initials(uname),
-                    timezone => tz,
-                }
-            })
-            .collect();
-        groups_ctx.push(context! { id => id, name => name, members => members_ctx });
-    }
-
-    // Get user's calendars (is_busy=1) for calendar selection
-    let calendars: Vec<(String, Option<String>, String)> = sqlx::query_as(
-        "SELECT c.id, c.display_name, cs.name FROM calendars c
-         JOIN caldav_sources cs ON cs.id = c.source_id
-         JOIN accounts a ON a.id = cs.account_id
-         WHERE a.user_id = ? AND c.is_busy = 1
-         ORDER BY cs.name, c.display_name",
-    )
-    .bind(&user.id)
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
-
-    let calendars_ctx: Vec<minijinja::Value> = calendars
-        .iter()
-        .map(|(id, display_name, source_name)| context! {
-            id => id,
-            name => format!("{} ({})", display_name.as_deref().unwrap_or("Unnamed"), source_name),
-        })
-        .collect();
+    let groups_ctx =
+        form_teams_with_members(&state.pool, &form_admin_teams(&state.pool, user).await).await;
+    let calendars_ctx = form_busy_calendars(&state.pool, &user.id).await;
 
     // Pre-fill availability from user's default schedule
     ensure_user_avail_seeded(&state.pool, &user.id).await;
@@ -665,7 +605,7 @@ pub(super) async fn create_event_type(
                 &auth_user,
                 &crate::i18n::translate(auth_user.lang, key, None),
                 &form,
-                false,
+                FormTarget::NewPersonal,
             )
             .await
             .into_response()
@@ -681,7 +621,7 @@ pub(super) async fn create_event_type(
             &auth_user,
             &crate::i18n::translate(auth_user.lang, key, None),
             &form,
-            false,
+            FormTarget::NewPersonal,
         )
         .await
         .into_response();
@@ -705,7 +645,7 @@ pub(super) async fn create_event_type(
             &auth_user,
             &crate::i18n::translate(auth_user.lang, "form-error-location-required", None),
             &form,
-            false,
+            FormTarget::NewPersonal,
         )
         .await
         .into_response();
@@ -722,7 +662,7 @@ pub(super) async fn create_event_type(
                 &auth_user,
                 &crate::i18n::translate(auth_user.lang, "form-error-not-team-admin", None),
                 &form,
-                false,
+                FormTarget::NewPersonal,
             )
             .await
             .into_response();
@@ -732,9 +672,15 @@ pub(super) async fn create_event_type(
     if let Some(err) =
         google_meet_location_error(&state.pool, location_type, Some(&user.id), team_id, None).await
     {
-        return render_event_type_form_error(&state, &auth_user, &err, &form, false)
-            .await
-            .into_response();
+        return render_event_type_form_error(
+            &state,
+            &auth_user,
+            &err,
+            &form,
+            FormTarget::NewPersonal,
+        )
+        .await
+        .into_response();
     }
 
     let visibility = match form.visibility.as_deref().unwrap_or("public") {
@@ -804,7 +750,8 @@ pub(super) async fn create_event_type(
     .execute(&state.pool)
     .await;
     if let Err(e) = written {
-        return event_type_write_failed(&state, &auth_user, &form, false, &e).await;
+        return event_type_write_failed(&state, &auth_user, &form, FormTarget::NewPersonal, &e)
+            .await;
     }
     save_pending_settings(&state.pool, &et_id, &form, true).await;
 
@@ -1060,26 +1007,7 @@ pub(super) async fn edit_event_type_form(
     // Build per-day schedule string
     let avail_schedule = build_avail_schedule(&all_rules);
 
-    // Get user's calendars (is_busy=1) for calendar selection
-    let calendars: Vec<(String, Option<String>, String)> = sqlx::query_as(
-        "SELECT c.id, c.display_name, cs.name FROM calendars c
-         JOIN caldav_sources cs ON cs.id = c.source_id
-         JOIN accounts a ON a.id = cs.account_id
-         WHERE a.user_id = ? AND c.is_busy = 1
-         ORDER BY cs.name, c.display_name",
-    )
-    .bind(&user.id)
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
-
-    let calendars_ctx: Vec<minijinja::Value> = calendars
-        .iter()
-        .map(|(id, display_name, source_name)| context! {
-            id => id,
-            name => format!("{} ({})", display_name.as_deref().unwrap_or("Unnamed"), source_name),
-        })
-        .collect();
+    let calendars_ctx = form_busy_calendars(&state.pool, &user.id).await;
 
     // Get currently selected calendars for this event type
     let selected_cals: Vec<(String,)> =
@@ -1099,45 +1027,7 @@ pub(super) async fn edit_event_type_form(
     let is_round_robin_group = team_id.is_some() && scheduling_mode == "round_robin";
     let is_collective_team = team_id.is_some() && scheduling_mode == "collective";
     let members_ctx: Vec<minijinja::Value> = if is_round_robin_group || is_collective_team {
-        let tid = team_id.as_deref().unwrap();
-        // Also selects timezone so admins can spot mis-configured user TZs at
-        // a glance when setting up a team event (e.g. a US member whose TZ
-        // is still the server default — which silently makes their personal
-        // working hours land in the wrong local time).
-        let members: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-            "SELECT u.id, u.name, u.avatar_path, u.timezone \
-             FROM users u JOIN team_members tm ON tm.user_id = u.id \
-             WHERE tm.team_id = ? AND u.enabled = 1 \
-             ORDER BY u.name",
-        )
-        .bind(tid)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default();
-
-        let et_weights: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT user_id, weight FROM event_type_member_weights WHERE event_type_id = ?",
-        )
-        .bind(&et_id)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default();
-        let wmap: std::collections::HashMap<String, i64> = et_weights.into_iter().collect();
-
-        members
-            .iter()
-            .map(|(uid, name, avatar_path, timezone)| {
-                let w = wmap.get(uid).copied().unwrap_or(1);
-                context! {
-                    user_id => uid,
-                    name => name,
-                    has_avatar => avatar_path.is_some(),
-                    initials => compute_initials(name),
-                    weight => w,
-                    timezone => timezone,
-                }
-            })
-            .collect()
+        form_priority_members(&state.pool, team_id.as_deref().unwrap_or(""), &et_id).await
     } else {
         Vec::new()
     };
@@ -1170,26 +1060,7 @@ pub(super) async fn edit_event_type_form(
 
     let (impersonating, impersonating_name, _) = impersonation_ctx(&auth_user);
 
-    // Eligible users for dynamic group link picker (excluding self)
-    let dg_eligible: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, username, name, avatar_path FROM users WHERE enabled = 1 AND allow_dynamic_group = 1 AND id != ? AND username IS NOT NULL ORDER BY name",
-    )
-    .bind(&user.id)
-    .fetch_all(&state.pool)
-    .await
-    .unwrap_or_default();
-    let dg_eligible_ctx: Vec<minijinja::Value> = dg_eligible
-        .iter()
-        .map(|(id, username, name, avatar_path)| {
-            context! {
-                id => id,
-                username => username,
-                name => name,
-                has_avatar => avatar_path.is_some(),
-                initials => compute_initials(name),
-            }
-        })
-        .collect();
+    let dg_eligible_ctx = form_dg_eligible_users(&state.pool, &user.id).await;
 
     // Personal event types (this handler is scoped team_id IS NULL) stay
     // global-admin only for resource attachment.
@@ -1306,7 +1177,7 @@ pub(super) async fn update_event_type(
                 &auth_user,
                 &crate::i18n::translate(auth_user.lang, key, None),
                 &form,
-                true,
+                FormTarget::EditPersonal { et_id: &et_id },
             )
             .await
             .into_response()
@@ -1341,7 +1212,7 @@ pub(super) async fn update_event_type(
                 &auth_user,
                 &crate::i18n::translate(auth_user.lang, "form-error-event-type-slug-taken", None),
                 &form,
-                true,
+                FormTarget::EditPersonal { et_id: &et_id },
             )
             .await
             .into_response();
@@ -1361,7 +1232,7 @@ pub(super) async fn update_event_type(
             &auth_user,
             &crate::i18n::translate(auth_user.lang, "form-error-location-required", None),
             &form,
-            true,
+            FormTarget::EditPersonal { et_id: &et_id },
         )
         .await
         .into_response();
@@ -1376,9 +1247,15 @@ pub(super) async fn update_event_type(
     )
     .await
     {
-        return render_event_type_form_error(&state, &auth_user, &err, &form, true)
-            .await
-            .into_response();
+        return render_event_type_form_error(
+            &state,
+            &auth_user,
+            &err,
+            &form,
+            FormTarget::EditPersonal { et_id: &et_id },
+        )
+        .await
+        .into_response();
     }
 
     let reminder_minutes = {
@@ -1443,7 +1320,14 @@ pub(super) async fn update_event_type(
     .execute(&state.pool)
     .await;
     if let Err(e) = written {
-        return event_type_write_failed(&state, &auth_user, &form, true, &e).await;
+        return event_type_write_failed(
+            &state,
+            &auth_user,
+            &form,
+            FormTarget::EditPersonal { et_id: &et_id },
+            &e,
+        )
+        .await;
     }
     save_pending_settings(&state.pool, &et_id, &form, false).await;
 
@@ -1756,6 +1640,176 @@ pub(super) async fn delete_event_type(
     Redirect::to("/dashboard/event-types").into_response()
 }
 
+// --- Event type form context, shared by the form pages and their error re-render ---
+
+/// Teams `user` may create event types for: every team for a global admin,
+/// otherwise the teams they administer.
+async fn form_admin_teams(pool: &SqlitePool, user: &crate::models::User) -> Vec<(String, String)> {
+    if user.role == "admin" {
+        sqlx::query_as("SELECT t.id, t.name FROM teams t ORDER BY t.name")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+    } else {
+        sqlx::query_as(
+            "SELECT t.id, t.name FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ? AND tm.role = 'admin' ORDER BY t.name",
+        )
+        .bind(&user.id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    }
+}
+
+/// `teams` with their enabled members, for the team picker of the personal
+/// create form and its client-side priority card.
+async fn form_teams_with_members(
+    pool: &SqlitePool,
+    teams: &[(String, String)],
+) -> Vec<minijinja::Value> {
+    let mut out = Vec::new();
+    for (id, name) in teams {
+        let team_members: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT u.id, u.name, u.avatar_path, u.timezone FROM users u \
+             JOIN team_members tm ON tm.user_id = u.id \
+             WHERE tm.team_id = ? AND u.enabled = 1 ORDER BY u.name",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        let members_ctx: Vec<minijinja::Value> = team_members
+            .iter()
+            .map(|(uid, uname, ap, tz)| {
+                context! {
+                    user_id => uid,
+                    name => uname,
+                    has_avatar => ap.is_some(),
+                    initials => compute_initials(uname),
+                    timezone => tz,
+                }
+            })
+            .collect();
+        out.push(context! { id => id, name => name, members => members_ctx });
+    }
+    out
+}
+
+/// The user's busy calendars (`is_busy = 1`), for the calendar selection.
+async fn form_busy_calendars(pool: &SqlitePool, user_id: &str) -> Vec<minijinja::Value> {
+    let calendars: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT c.id, c.display_name, cs.name FROM calendars c
+         JOIN caldav_sources cs ON cs.id = c.source_id
+         JOIN accounts a ON a.id = cs.account_id
+         WHERE a.user_id = ? AND c.is_busy = 1
+         ORDER BY cs.name, c.display_name",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    calendars
+        .iter()
+        .map(|(id, display_name, source_name)| context! {
+            id => id,
+            name => format!("{} ({})", display_name.as_deref().unwrap_or("Unnamed"), source_name),
+        })
+        .collect()
+}
+
+/// Enabled members of `team_id` with their weight on event type `et_id`
+/// (round-robin priority, or 0 for a member a collective event type
+/// excludes). Also selects each timezone so admins can spot a member whose
+/// timezone is still the server default, which silently puts their working
+/// hours in the wrong local time.
+async fn form_priority_members(
+    pool: &SqlitePool,
+    team_id: &str,
+    et_id: &str,
+) -> Vec<minijinja::Value> {
+    let members: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
+        "SELECT u.id, u.name, u.avatar_path, u.timezone \
+         FROM users u JOIN team_members tm ON tm.user_id = u.id \
+         WHERE tm.team_id = ? AND u.enabled = 1 \
+         ORDER BY u.name",
+    )
+    .bind(team_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let et_weights: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT user_id, weight FROM event_type_member_weights WHERE event_type_id = ?",
+    )
+    .bind(et_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let wmap: std::collections::HashMap<String, i64> = et_weights.into_iter().collect();
+    members
+        .iter()
+        .map(|(uid, name, avatar_path, timezone)| {
+            let w = wmap.get(uid).copied().unwrap_or(1);
+            context! {
+                user_id => uid,
+                name => name,
+                has_avatar => avatar_path.is_some(),
+                initials => compute_initials(name),
+                weight => w,
+                timezone => timezone,
+            }
+        })
+        .collect()
+}
+
+/// Teams offered as watchers on a team event type's edit form: every team
+/// for a global admin, otherwise the teams `user` belongs to.
+async fn form_watcher_teams(
+    pool: &SqlitePool,
+    user: &crate::models::User,
+) -> Vec<minijinja::Value> {
+    let teams: Vec<(String, String)> = if user.role == "admin" {
+        sqlx::query_as("SELECT id, name FROM teams ORDER BY name")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default()
+    } else {
+        sqlx::query_as(
+            "SELECT t.id, t.name FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ? ORDER BY t.name",
+        )
+        .bind(&user.id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+    };
+    teams
+        .iter()
+        .map(|(id, name)| context! { id => id, name => name })
+        .collect()
+}
+
+/// Users the dynamic group link picker offers (excluding `user_id`).
+async fn form_dg_eligible_users(pool: &SqlitePool, user_id: &str) -> Vec<minijinja::Value> {
+    let users: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, username, name, avatar_path FROM users WHERE enabled = 1 AND allow_dynamic_group = 1 AND id != ? AND username IS NOT NULL ORDER BY name",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    users
+        .iter()
+        .map(|(id, username, name, avatar_path)| {
+            context! {
+                id => id,
+                username => username,
+                name => name,
+                has_avatar => avatar_path.is_some(),
+                initials => compute_initials(name),
+            }
+        })
+        .collect()
+}
+
 /// The form error key for `slug` when another event type already holds it,
 /// `None` when it is free. The schema keeps slugs unique per account
 /// (personal and team event types alike, since a team event type is stored
@@ -1799,7 +1853,7 @@ async fn event_type_write_failed(
     state: &AppState,
     auth_user: &crate::auth::AuthUser,
     form: &EventTypeForm,
-    editing: bool,
+    target: FormTarget<'_>,
     error: &sqlx::Error,
 ) -> axum::response::Response {
     let Some(key) = slug_taken_key(error) else {
@@ -1810,7 +1864,7 @@ async fn event_type_write_failed(
         auth_user,
         &crate::i18n::translate(auth_user.lang, key, None),
         form,
-        editing,
+        target,
     )
     .await
     .into_response()
@@ -1831,16 +1885,76 @@ pub(super) fn slug_taken_key(error: &sqlx::Error) -> Option<&'static str> {
     }
 }
 
+/// Which form an error re-render is for. The page must carry the same team,
+/// calendar and member context as the form it replaces: a section left out
+/// is not posted back, and the resubmit then silently drops what it held (a
+/// team create turning personal, a collective event type turning
+/// round-robin, watchers or calendars cleared).
+#[derive(Clone, Copy)]
+enum FormTarget<'a> {
+    NewPersonal,
+    EditPersonal { et_id: &'a str },
+    NewTeam { team_id: &'a str },
+    EditTeam { team_id: &'a str, et_id: &'a str },
+}
+
 async fn render_event_type_form_error(
     state: &AppState,
     auth_user: &crate::auth::AuthUser,
     error: &str,
     form: &EventTypeForm,
-    editing: bool,
+    target: FormTarget<'_>,
 ) -> Html<String> {
     let tmpl = match state.templates.get_template("event_type_form.html") {
         Ok(t) => t,
         Err(e) => return internal_error_html("template render", &e),
+    };
+    let pool = &state.pool;
+    let user = &auth_user.user;
+    let editing = matches!(
+        target,
+        FormTarget::EditPersonal { .. } | FormTarget::EditTeam { .. }
+    );
+    let scheduling_mode = match form.scheduling_mode.as_deref() {
+        Some("collective") => "collective",
+        _ => "round_robin",
+    };
+    let posted_team = form.team_id.as_deref().unwrap_or("");
+    let (is_group, form_team_id) = match target {
+        FormTarget::NewTeam { team_id } | FormTarget::EditTeam { team_id, .. } => (true, team_id),
+        _ => (false, posted_team),
+    };
+    let teams = match target {
+        FormTarget::NewPersonal => {
+            form_teams_with_members(pool, &form_admin_teams(pool, user).await).await
+        }
+        FormTarget::NewTeam { .. } => form_admin_teams(pool, user)
+            .await
+            .iter()
+            .map(|(id, name)| context! { id => id, name => name })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let watcher_teams = match target {
+        FormTarget::NewTeam { .. } => teams.clone(),
+        FormTarget::EditTeam { .. } => form_watcher_teams(pool, user).await,
+        _ => Vec::new(),
+    };
+    let priority_members = match target {
+        FormTarget::EditTeam { team_id, et_id } => {
+            form_priority_members(pool, team_id, et_id).await
+        }
+        _ => Vec::new(),
+    };
+    let calendars = match target {
+        FormTarget::NewPersonal | FormTarget::EditPersonal { .. } => {
+            form_busy_calendars(pool, &user.id).await
+        }
+        _ => Vec::new(),
+    };
+    let dg_eligible_users = match target {
+        FormTarget::EditPersonal { .. } => form_dg_eligible_users(pool, &user.id).await,
+        _ => Vec::new(),
     };
 
     // Echo the submitted resource selection back. Omitting resources_all
@@ -1906,6 +2020,21 @@ async fn render_event_type_form_error(
             form_pending => PendingSettings::from_form(form)
                 .unwrap_or(PendingSettings::DEFAULT)
                 .context(),
+            form_reminder_minutes => parse_int_field(&form.reminder_minutes, 0),
+            form_max_additional_guests => parse_int_field(&form.max_additional_guests, 0),
+            form_scheduling_mode => scheduling_mode,
+            is_group => is_group,
+            form_team_id => form_team_id,
+            teams => teams,
+            watcher_teams => watcher_teams,
+            selected_watcher_team_ids => form.watcher_team_ids.as_deref().unwrap_or(""),
+            is_round_robin_group => is_group && scheduling_mode == "round_robin",
+            is_collective_team => is_group && scheduling_mode == "collective",
+            priority_members => priority_members,
+            calendars => calendars,
+            selected_calendar_ids => form.calendar_ids.as_deref().unwrap_or(""),
+            owner_username => user.username.as_deref().unwrap_or(""),
+            dg_eligible_users => dg_eligible_users,
             tz_options => timezone_options(form.timezone.as_deref().unwrap_or(&auth_user.user.timezone), auth_user.lang),
             error => error,
             sidebar => sidebar_context(auth_user, "event-types"),
@@ -2123,20 +2252,7 @@ pub(super) async fn new_group_event_type_form(
     let user = &auth_user.user;
     let is_admin = user.role == "admin";
 
-    let groups: Vec<(String, String)> = if is_admin {
-        sqlx::query_as("SELECT t.id, t.name FROM teams t ORDER BY t.name")
-            .fetch_all(&state.pool)
-            .await
-            .unwrap_or_default()
-    } else {
-        sqlx::query_as(
-            "SELECT t.id, t.name FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ? AND tm.role = 'admin' ORDER BY t.name",
-        )
-        .bind(&user.id)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default()
-    };
+    let groups = form_admin_teams(&state.pool, user).await;
 
     if groups.is_empty() {
         return Html(if is_admin {
@@ -2266,7 +2382,7 @@ pub(super) async fn create_group_event_type(
                 &auth_user,
                 &crate::i18n::translate(auth_user.lang, key, None),
                 &form,
-                false,
+                FormTarget::NewTeam { team_id: &team_id },
             )
             .await
             .into_response()
@@ -2279,7 +2395,7 @@ pub(super) async fn create_group_event_type(
             &auth_user,
             &crate::i18n::translate(auth_user.lang, key, None),
             &form,
-            false,
+            FormTarget::NewTeam { team_id: &team_id },
         )
         .await
         .into_response();
@@ -2304,7 +2420,7 @@ pub(super) async fn create_group_event_type(
             &auth_user,
             &crate::i18n::translate(auth_user.lang, "form-error-location-required", None),
             &form,
-            false,
+            FormTarget::NewTeam { team_id: &team_id },
         )
         .await
         .into_response();
@@ -2313,9 +2429,15 @@ pub(super) async fn create_group_event_type(
     if let Some(err) =
         google_meet_location_error(&state.pool, location_type, None, Some(&team_id), None).await
     {
-        return render_event_type_form_error(&state, &auth_user, &err, &form, false)
-            .await
-            .into_response();
+        return render_event_type_form_error(
+            &state,
+            &auth_user,
+            &err,
+            &form,
+            FormTarget::NewTeam { team_id: &team_id },
+        )
+        .await
+        .into_response();
     }
 
     let default_calendar_view = match form.default_calendar_view.as_deref().unwrap_or("month") {
@@ -2368,7 +2490,14 @@ pub(super) async fn create_group_event_type(
     .execute(&state.pool)
     .await;
     if let Err(e) = written {
-        return event_type_write_failed(&state, &auth_user, &form, false, &e).await;
+        return event_type_write_failed(
+            &state,
+            &auth_user,
+            &form,
+            FormTarget::NewTeam { team_id: &team_id },
+            &e,
+        )
+        .await;
     }
     save_pending_settings(&state.pool, &et_id, &form, true).await;
 
@@ -2624,65 +2753,12 @@ pub(super) async fn edit_group_event_type_form(
     let is_round_robin_group = scheduling_mode == "round_robin";
     let is_collective_team = scheduling_mode == "collective";
     let members_ctx: Vec<minijinja::Value> = if is_round_robin_group || is_collective_team {
-        // See the note on the personal-ET edit path: pulling `timezone` makes
-        // wrong-TZ users visible on the Member priority list.
-        let members: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-            "SELECT u.id, u.name, u.avatar_path, u.timezone \
-             FROM users u JOIN team_members tm ON tm.user_id = u.id \
-             WHERE tm.team_id = ? AND u.enabled = 1 \
-             ORDER BY u.name",
-        )
-        .bind(&team_id)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default();
-
-        let et_weights: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT user_id, weight FROM event_type_member_weights WHERE event_type_id = ?",
-        )
-        .bind(&et_id)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default();
-        let wmap: std::collections::HashMap<String, i64> = et_weights.into_iter().collect();
-
-        members
-            .iter()
-            .map(|(uid, name, avatar_path, timezone)| {
-                let w = wmap.get(uid).copied().unwrap_or(1);
-                context! {
-                    user_id => uid,
-                    name => name,
-                    has_avatar => avatar_path.is_some(),
-                    initials => compute_initials(name),
-                    weight => w,
-                    timezone => timezone,
-                }
-            })
-            .collect()
+        form_priority_members(&state.pool, &team_id, &et_id).await
     } else {
         Vec::new()
     };
 
-    // Load all teams for watcher selection
-    let all_teams: Vec<(String, String)> = if is_admin {
-        sqlx::query_as("SELECT id, name FROM teams ORDER BY name")
-            .fetch_all(&state.pool)
-            .await
-            .unwrap_or_default()
-    } else {
-        sqlx::query_as(
-            "SELECT t.id, t.name FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.user_id = ? ORDER BY t.name",
-        )
-        .bind(&user.id)
-        .fetch_all(&state.pool)
-        .await
-        .unwrap_or_default()
-    };
-    let watcher_teams_ctx: Vec<minijinja::Value> = all_teams
-        .iter()
-        .map(|(id, name)| context! { id => id, name => name })
-        .collect();
+    let watcher_teams_ctx = form_watcher_teams(&state.pool, user).await;
 
     // Load selected watcher team IDs
     let selected_watchers: Vec<(String,)> =
@@ -2844,7 +2920,10 @@ pub(super) async fn update_group_event_type(
                 &auth_user,
                 &crate::i18n::translate(auth_user.lang, key, None),
                 &form,
-                true,
+                FormTarget::EditTeam {
+                    team_id: &team_id,
+                    et_id: &et_id,
+                },
             )
             .await
             .into_response()
@@ -2883,7 +2962,10 @@ pub(super) async fn update_group_event_type(
                 &auth_user,
                 &crate::i18n::translate(auth_user.lang, key, None),
                 &form,
-                true,
+                FormTarget::EditTeam {
+                    team_id: &team_id,
+                    et_id: &et_id,
+                },
             )
             .await
             .into_response();
@@ -2903,7 +2985,10 @@ pub(super) async fn update_group_event_type(
             &auth_user,
             &crate::i18n::translate(auth_user.lang, "form-error-location-required", None),
             &form,
-            true,
+            FormTarget::EditTeam {
+                team_id: &team_id,
+                et_id: &et_id,
+            },
         )
         .await
         .into_response();
@@ -2918,9 +3003,18 @@ pub(super) async fn update_group_event_type(
     )
     .await
     {
-        return render_event_type_form_error(&state, &auth_user, &err, &form, true)
-            .await
-            .into_response();
+        return render_event_type_form_error(
+            &state,
+            &auth_user,
+            &err,
+            &form,
+            FormTarget::EditTeam {
+                team_id: &team_id,
+                et_id: &et_id,
+            },
+        )
+        .await
+        .into_response();
     }
 
     let reminder_minutes = {
@@ -2985,7 +3079,17 @@ pub(super) async fn update_group_event_type(
     .execute(&state.pool)
     .await;
     if let Err(e) = written {
-        return event_type_write_failed(&state, &auth_user, &form, true, &e).await;
+        return event_type_write_failed(
+            &state,
+            &auth_user,
+            &form,
+            FormTarget::EditTeam {
+                team_id: &team_id,
+                et_id: &et_id,
+            },
+            &e,
+        )
+        .await;
     }
     save_pending_settings(&state.pool, &et_id, &form, false).await;
 
